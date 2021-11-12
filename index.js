@@ -1,147 +1,55 @@
-const fs = require('fs');
-const util = require('util');
-const readFile = util.promisify(fs.readFile);
+const MY_FIGHTER_ID = 'dy__dx';
+const RESPONSES_PATH = `replaysearchresponses/2021-11-10-${MY_FIGHTER_ID}`;
 
+const filterAfterDate = new Date('2021-10-20T04:00:00.000Z');
+const filterByCharacter = 'kolin';
 
-const MY_PLAYER_ID = '131418';
+const fs = require('fs').promises;
+const path = require('path');
+const parseMatch = require('./lib/parse-match');
+const { calculateMatchups, calculateBo3Matchups } = require('./lib/stats');
 
-const RESPONSES_FILE = 'replaysearchresponses/2019-04-11-concatenated';
+async function main() {
+  const filePaths = (await fs.readdir(RESPONSES_PATH))
+    .sort((a, b) => a.localeCompare(b, 'en-u-kn-true')) // natural numeric sort
+    .map(name => path.join(RESPONSES_PATH, name));
 
+  const responses = await Promise.all(filePaths.map(f => fs.readFile(f, 'utf-8')));
 
-const SEC_TO_WIN32_EPOCH = 50491123200;
-const SEC_TO_UNIX_EPOCH = 11644473600;
-
-// 100ns ticks since January 1, 0001, 00:00:00
-function parseUploadDate(s) {
-  const unixMs = 1000 * (Number(s.substr(0, s.length - 7)) - SEC_TO_WIN32_EPOCH - SEC_TO_UNIX_EPOCH);
-  return new Date(unixMs);
-}
-
-function parseMatchType(s) {
-  if (s === 'rm') {
-    return 'ranked';
-  } else if (s === 'cm') {
-    return 'casual';
-  } else if (s === '2') {
-    return 'lounge';
-  }
-  throw new Error(`unexpected match type ${s}`);
-}
-
-function findPlayer(result, playerId) {
-  const p1 = result.leftplayer[0];
-  const p2 = result.rightplayer[0];
-  if (playerId === p1.publicid) {
-    return p1;
-  } else if (playerId === p2.publicid) {
-    return p2;
-  }
-  throw new Error(`could not find playerId ${playerId} in result`);
-}
-
-const charactersById = {
-  0: 'ryu',
-  1: 'mbison',
-  2: 'chunli',
-  3: 'ken',
-  4: 'karin',
-  5: 'zangief',
-  6: 'dhalsim',
-  7: 'nash',
-  8: 'vega',
-  9: 'juri',
-  10: 'birdie',
-  11: 'r_mika',
-  12: 'rashid',
-  13: 'fang',
-  14: 'laura',
-  15: 'necalli',
-  16: 'cammy',
-  17: 'guile',
-  18: 'ibuki',
-  19: 'balrog',
-  20: 'urien',
-  21: 'alex',
-  23: 'akuma',
-  24: 'kolin',
-  25: 'ed', // probably
-  26: 'menat', // wild guess
-  27: 'abigail',
-  28: 'zeku', // probably
-  29: 'sakura', // probably
-  30: 'blanka', // probably
-  31: 'falke', // probably
-  32: 'cody',
-  33: 'g',
-  34: 'sagat',
-  35: 'kage',
-};
-
-function parsePlayer(p) {
-  p.character = charactersById[parseInt(p.charaid, 10)];
-  return p;
-}
-
-function parseMatch(r) {
-  const p1Id = r.leftplayer[0].publicid;
-  const p2Id = r.rightplayer[0].publicid;
-  const opponentId = MY_PLAYER_ID === p1Id ? p2Id : p1Id;
-
-  return {
-    matchId: r.matchid,
-    date: parseUploadDate(r.uploaddate),
-    matchType: parseMatchType(r.matchtype),
-
-    isVictory: r.winner === MY_PLAYER_ID,
-    isTie: r.winner === r.loser,
-
-    me: parsePlayer(findPlayer(r, MY_PLAYER_ID)),
-    opponent: parsePlayer(findPlayer(r, opponentId)),
-  };
-}
-
-readFile(RESPONSES_FILE, 'utf-8').then(data => {
   const searchResults = [];
-
-  data.split("\n").filter(s => s.length).map(JSON.parse).forEach(({ common, response }) => {
-    if (response.length != 1) {
-      throw new Error("response.length != 1");
+  responses.map(JSON.parse).forEach(({ /*common,*/ response }) => {
+    if (response.length !== 1) {
+      throw new Error('response.length !== 1');
     }
-    const { searchresult, searchreplaymeta } = response[0];
+    const { searchresult /*, searchreplaymeta*/ } = response[0];
     searchResults.push(...searchresult);
   });
 
-  const matches = searchResults.map(parseMatch);
-  const rankedMatches = matches.filter(m => m.matchType === 'ranked');
+  const allMatches = searchResults.map(r => parseMatch(r, MY_FIGHTER_ID)).filter(m => !!m);
+  const rankedMatches = allMatches.filter(m => m.matchType === 'ranked');
 
-  const june2018 = Date.parse('2018-06-01T00:00:00.000Z');
-  const rankedMatchesSinceJune = rankedMatches.filter(m => m.date > june2018 && m.me.character === 'karin');
-
-  const matchupsByCharacter = {};
-
-  rankedMatchesSinceJune.forEach(({ isVictory, opponent: { character } }) => {
-    if (!matchupsByCharacter[character]) {
-      matchupsByCharacter[character] = { wins: 0, losses: 0 };
+  // Calculate lp gain for each match by looking at my lp of the next match
+  rankedMatches.forEach((m, idx) => {
+    if (idx === 0) {
+      // don't know how much lp I gained from the most recent match - will have to request profile for current lp.
+      // just guess "65 points" for now.
+      m.lpGain = m.isVictory ? 65 : -65;
+      return;
     }
-
-    if (isVictory) {
-      matchupsByCharacter[character].wins += 1;
-    } else {
-      matchupsByCharacter[character].losses += 1;
+    m.lpGain = rankedMatches[idx-1].me.lp - m.me.lp;
+    // sanity check
+    if ((m.isVictory && m.lpGain < 0) || (!m.isVictory && m.lpGain > 0)) {
+      console.error("lpGain doesn't look right", m);
     }
   });
 
+  const filteredMatches = rankedMatches.filter(m => m.date > filterAfterDate && m.me.character === filterByCharacter);
 
-  console.log('ranked matches since june 2018 where I played karin:', rankedMatchesSinceJune.length);
+  console.log(`ranked matches since ${filterAfterDate} where I played ${filterByCharacter}: ${filteredMatches.length}`);
 
-  // Convert to an array so I can sort the results
-  const matchupsTable = [];
+  console.log(calculateMatchups(filteredMatches).formatted);
 
-  for (let name in matchupsByCharacter) {
-    const m = matchupsByCharacter[name];
-    m.ratio = m.wins / m.losses;
-    matchupsTable.push({ character: name, ...m });
-  }
+  console.log(calculateBo3Matchups(filteredMatches).formatted);
+}
 
-  console.table(matchupsTable.sort((a, b) => a.ratio - b.ratio));
-});
+main();
