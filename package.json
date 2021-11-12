@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "eslint": "^8.2.0",
+    "request": "^2.88.2",
+    "table": "^6.7.3"
+  }
+}
